@@ -1,0 +1,443 @@
+---
+title: "GResearch Extra Models"
+author: "Calvin Yong"
+date: "May 12, 2018"
+output: 
+  html_document: 
+    df_print: kable
+    code_folding: show
+    highlight: textmate
+    theme: cerulean
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo = F}
+setwd("~/Documents/Programming Workspace/Data Science Comps/GResearch comp/")
+```
+
+## Introduction
+
+This report was made after the GResearch competition ended. This part of the report will first show some extra data exploration and visualizations and experiment with other machine learning models like linear regression, ridge regression, lasso regression, elastic net regression, and random forests. We will also consider feature selection using best subset selection and construct new features to improve prediction for regularized gradient boosted trees using xgboost. The goal is to find the best model(s) that best predicts the data, not to provide a simple model that is easy to understand.
+
+All code is hidden, but you can click on the code buttons to display the code producing the output.
+
+## Extra Data Exploration and Visualizations
+
+Here is the description of the features from the GResearch website:
+
+- x0…x3E: Predictors that relate to the observed behavior of the instrument on the day in question. The features labelled ‘x3A’, ‘x3B’, etc. are strongly related and might be expected to be highly correlated.
+
+- x4…x6: Predictors that describe the ‘typical’ behavior that we would expect of the instrument on that day.
+
+It's hard to make conclusions or stories when the description of the features on the GResearch is pretty vague. We can still do some data exploration though. We start by loading the training and test data.
+
+```{r, message=F}
+library(data.table)
+library(plotly)
+ogtrain = fread("train.csv")
+test = fread("test.csv")
+train = ogtrain
+```
+
+
+### Stocks and Market
+
+We can calculate the number of stocks in each market for the training and test sets.
+
+```{r}
+train[, list(Days = length(unique(Day)), "Stocks in Market for train" = length(unique(Stock))), by = Market]
+test[, list(Days = length(unique(Day)), "Stocks in Market in test" = length(unique(Stock))), by = Market]
+```
+
+### Weights
+
+We can calculate the average weight for each day (considering all stocks).
+
+```{r}
+dt_avgWeight_byDay = train[, list(Weight = mean(Weight)), by = Day]
+plot(sort(unique(train$Day)), dt_avgWeight_byDay[order(dt_avgWeight_byDay$Day)][["Weight"]],
+     type = 'l', xlab = "Day", ylab = "Average Weight")
+```
+
+The plot seems to be reasonably stationary. There is no indication that some time interval is more important than any other point in time. Then we calculate the average weight for each stock.
+
+```{r}
+dt_avgWeight_byStock = train[, list(Weight = mean(Weight)), by = Stock]
+dt_avgWeight_byStock = dt_avgWeight_byStock[order(dt_avgWeight_byStock$Weight)]
+plot_ly(data = dt_avgWeight_byStock, x = ~Stock, y = ~Weight,
+        type = 'bar') %>% layout(title = "Average Weight by Stock")
+```
+
+The plot is not like a flat box. We can see that there are some stocks that are very important.
+
+### Response y
+
+We can calculate the average response for each market.
+
+```{r}
+dt = train[, list(y = mean(y)), by = Market]
+plot_ly(data = dt, x = ~Market, y = ~y, type = 'bar')
+```
+
+The markets all have an average response close to zero. Nothing too special. We can plot the average response for each day and the cumulative response for each day.
+
+```{r}
+dt_avgt_byDay = train[, list(y = mean(y)), by = Day]
+plot(sort(unique(train$Day)), dt_avgt_byDay$y, type = 'l', xlab = "Day", ylab = "y", main = "Avarage Response by Day")
+plot(sort(unique(train$Day)), cumsum(dt_avgt_byDay$y), type = 'l', xlab = "Day", ylab = "Cumulative sum of y", main = "Cumulative Response by Day")
+```
+
+If the response is actually a return, that portfolio or strategy is pretty good.
+
+## Extra Basic Models
+
+Some models do not handle missing data well, so we will replace the missing values with the median for its respective column. We will also factor our categorical variable `Market`. R's linear model algorithm will transform the factor to dummy variables. (I tested linear regression with the factored variable, and using linear regression gave lower wMSE compared to using it as a integer variable).
+
+```{r}
+train$x1[is.na(train$x1)] = median(train$x1, na.rm = T)
+train$x2[is.na(train$x2)] = median(train$x2, na.rm = T)
+test$x2[is.na(test$x2)] = median(test$x2, na.rm = T)
+test$x2[is.na(test$x2)] = median(test$x2, na.rm = T)
+
+train$Market = as.factor(train$Market)
+```
+
+First we split the train data set into a training set and a validation set. We will take 75% of the data to be training data and the other 25% to be testing data.
+
+```{r}
+set.seed(42)
+
+splitpcent = floor(0.75*nrow(train))
+sample1 = sample(seq_len(nrow(train)), size = splitpcent)
+
+train_set = train[sample1, ]
+train_labels = train_set$y
+train_weights = train_set$Weight
+
+test_set = train[-sample1, ]
+test_labels = test_set$y
+test_weights = test_set$Weight
+
+
+train_set = train_set[, c("Index", "Weight") := NULL]
+test_set = test_set[, c("Index", "Weight", "y") := NULL]
+```
+
+The two error metrics we will use are the root mean squared error (RMSE) and the weighted mean squared error (wMSE). The formulas for each of them are
+
+\begin{gather}
+\text{rMSE} = \sqrt{\sum_i^n \frac{1}{n}\bigg(\hat{y_i} - y_i\bigg)^2} \\
+\text{wMSE} = \sum_i^n w_i(\hat{y} - y_i)^2.
+\end{gather}
+
+```{r}
+calcRMSE = function(labels, preds) {
+  rmse = sqrt((1/length(labels))*(sum(labels - preds)^2))
+  return(rmse)
+}
+
+calcWMSE = function(labels, pred, weight) {
+  wmse = sum(weight*(labels - pred)^2)
+  return(wmse)
+}
+```
+
+We consider them both since some machine learning algorithms do not support customized loss functions, even though the GResearch competition only uses the wMSE.
+
+### Linear Regression
+
+We start with one of the most oldest but important machine learning model, linear regression. We will make a linear regression model with all of the predictors and all pairwise interactions and evaluate the rMSE and wMSE.
+
+```{r}
+lm_train = lm(y ~ . + .*., data = train_set)
+train_pred = predict(lm_train, train_set)
+pred1 = predict(lm_train, test_set)
+
+train_rmse1 = calcRMSE(train_labels, train_pred)
+train_wmse1 = calcWMSE(train_labels, train_pred, train_weights)
+test_rmse1 = calcRMSE(test_labels, pred1)
+test_wmse1 = calcWMSE(test_labels, pred1, test_weights)
+
+cat("Train RMSE = ", train_rmse1, "\n")
+cat("Train WMSE = ", train_wmse1, "\n")
+cat("Test RMSE = ", test_rmse1, "\n")
+cat("Test WMSE = ", test_wmse1, "\n")
+```
+
+Note that the model we used minimizes the residual sum of squares (RSS), which is given by $\sum_i^n (\hat{y_i} - y_i)^2$. The train rMSE is very low, but all of the test errors are very high. The test wMSE is very horrible. This could indicate that the model is too flexible and is overfitting to the data. We will try a linear regression model using ordinary least squares (OLS) without the interaction terms.
+
+```{r}
+lm_train = lm(y ~ ., data = train_set)
+train_pred = predict(lm_train, train_set)
+pred1 = predict(lm_train, test_set)
+
+train_rmse2 = calcRMSE(train_labels, train_pred)
+train_wmse2 = calcWMSE(train_labels, train_pred, train_weights)
+test_rmse2 = calcRMSE(test_labels, pred1)
+test_wmse2 = calcWMSE(test_labels, pred1, test_weights)
+
+cat("Train RMSE = ", train_rmse2, "\n")
+cat("Train WMSE = ", train_wmse2, "\n")
+cat("Test RMSE = ", test_rmse2, "\n")
+cat("Test WMSE = ", test_wmse2, "\n")
+```
+
+The results look much better, but it could be better. We can also do linear regression by weighted least squares (WLS) method. This will minimize the wMSE instead of the RSS.
+
+```{r}
+lm_train = lm(y ~ ., data = train_set, weights = train_weights)
+train_pred = predict(lm_train, train_set)
+pred1 = predict(lm_train, test_set)
+
+train_rmse3 = calcRMSE(train_labels, train_pred)
+train_wmse3 = calcWMSE(train_labels, train_pred, train_weights)
+test_rmse3 = calcRMSE(test_labels, pred1)
+test_wmse3 = calcWMSE(test_labels, pred1, test_weights)
+
+cat("Train RMSE = ", train_rmse3, "\n")
+cat("Train WMSE = ", train_wmse3, "\n")
+cat("Test RMSE = ", test_rmse3, "\n")
+cat("Test WMSE = ", test_wmse3, "\n")
+```
+
+The errors are a little bit higher. A little disappointing, but they are more representative of the actual error we will make if we participated in the competition where the error metric used is wMSE. We can print out a summary of the regression model.
+
+
+```{r}
+summary(lm_train)
+```
+
+Note that `x1` and `Day` are considered not statistically significant. When we use best subset selection or stepwise selection, those two predictors will most likely be the first ones to be removed from the model. Also notice that the predictors `x3A, ..., x3E` have very high standard errors compared to the other predictors. This phenomenon is called *multicolinearity*, where the standard errors are inflated due to correlated variables in the model. The correlated variables provide redundant information and may make the predictions more variable or make the model too complicated.
+
+### Best Subset Selection
+
+We will perform best subset selection and look at some metrics to choose a best model for weighted linear regression.
+
+```{r}
+library(leaps)
+regfit = regsubsets(y ~ ., data = train_set, weights = train_weights, nvmax = 16)
+summary(regfit)
+
+par(mfrow = c(2,2))
+plot(summary(regfit)$rss, xlab = "Number of Predictors", ylab = "R^2", main = "R^2", type = 'l')
+plot(summary(regfit)$adjr2, xlab = "Number of Predictors", ylab = "Adj R^2", main = "Adj R^2", type = 'l')
+points(which.max(summary(regfit)$adjr2), summary(regfit)$adjr2[which.max(summary(regfit)$adjr2)], col = 'red', pch = 20, cex = 2)
+plot(summary(regfit)$cp, xlab = "Number of Predictors", ylab = "Cp", main = "Mallow's Cp", type = 'l')
+points(which.min(summary(regfit)$cp), summary(regfit)$cp[which.min(summary(regfit)$cp)], col = 'red', pch = 20, cex = 2)
+plot(summary(regfit)$bic, xlab = "Number of Predictors", ylab = "BIC", main = "BIC", type = 'l')
+points(which.min(summary(regfit)$bic), summary(regfit)$bic[which.min(summary(regfit)$bic)], col = 'red', pch = 20, cex = 2)
+```
+
+The plots above show that we should use most of the predictors. Note that $R^2$ is always monotone decreasing, so we do not need to show the minimum value. We will evaluate a weighted linear regression model removing `x1`
+
+```{r}
+lm_train = lm(y ~ . -x1, data = train_set, weights = train_weights)
+train_pred = predict(lm_train, train_set)
+pred1 = predict(lm_train, test_set)
+
+train_rmse4 = calcRMSE(train_labels, train_pred)
+train_wmse4 = calcWMSE(train_labels, train_pred, train_weights)
+test_rmse4 = calcRMSE(test_labels, pred1)
+test_wmse4 = calcWMSE(test_labels, pred1, test_weights)
+
+cat("Train RMSE = ", train_rmse4, "\n")
+cat("Train WMSE = ", train_wmse4, "\n")
+cat("Test RMSE = ", test_rmse4, "\n")
+cat("Test WMSE = ", test_wmse4, "\n")
+```
+
+The smaller model underperforms compared to the full weighted linear regression. If we tested a model without `x1` and `Day`, we would see that it is also worse than the model without `x1`. Keep in mind that our goal is to make the best predictions for the data, not to provide a simple model to understand. Selection can be improved by performing cross-validation, but most likely keeping the full model would be better for prediction.
+
+
+### Ridge Regression
+
+We want to do weighted ridge regression. The difference between linear regression and ridge regression is that ridge regression adds an $\ell_2$ penalty to the loss function. We will use the `glmnet` package to make a ridge regression model. Note the `glmnet()` function standardizes the features. Then we will perform cross-validation to select the best $\lambda$ for the model.
+
+```{r, message=F}
+library(glmnet)
+x = model.matrix(y ~ ., data = train_set)[,-1]
+
+cv_out = cv.glmnet(x, train_labels, alpha = 0, weights = train_weights)
+plot(cv_out)
+cv_out$lambda.min
+```
+
+The best $\lambda$ is `r cv_out$lambda.min`. We now build our ridge regression model with the best $\lambda$ and evaluate the model.
+
+```{r}
+ridge_lm = glmnet(x, train_labels, alpha = 0, weights = train_weights)
+pred2 = predict(ridge_lm, newx = model.matrix(~ . - 1, data = test_set)[, -1], s = cv_out$lambda.min)
+
+test_rmse5 = calcRMSE(test_labels, pred2)
+test_wmse5 = calcWMSE(test_labels, pred2, test_weights)
+cat("Test RMSE = ", test_rmse5, "\n")
+cat("Test WMSE = ", test_wmse5, "\n")
+```
+
+The model does better than the linear regression with WLS according to both error metrics.
+
+### Lasso Regression
+
+Instead of adding an $\ell_2$ regularization term to the loss function, we can add an $\ell_1$ penalty instead. Like before, we use cross-validation to select the best $\lambda$, then build our model.
+
+```{r}
+cv_out = cv.glmnet(x, train_labels, alpha = 1, weights = train_weights)
+plot(cv_out)
+cv_out$lambda.min
+```
+
+
+```{r}
+lasso_lm = glmnet(x, train_labels, alpha = 1, weights = train_weights)
+pred3 = predict(lasso_lm, newx = model.matrix(~ . - 1, data = test_set)[, -1], s = cv_out$lambda.min)
+
+test_rmse6 = calcRMSE(test_labels, pred3)
+test_wmse6 = calcWMSE(test_labels, pred3, test_weights)
+cat("Test RMSE = ", test_rmse6, "\n")
+cat("Test WMSE = ", test_wmse6, "\n")
+```
+
+The weighted lasso regression performs about as well as weighted ridge regression according to the wMSE.
+
+### Elastic Net Regression
+
+The lasso and ridge regression have their own advantages and disadvantages. We can combine both of the penalty terms in our loss function and weight them with the parameter $\alpha$. This is called Elastic Net Regression. Let's show a plot of the MSE as a function of $log(\lambda)$ with different values of $\alpha$.
+
+
+```{r, message=F}
+library(glmnetUtils)
+cva = cva.glmnet(x, train_labels)
+plot(cva)
+```
+
+The curves pretty much behave in the same way. We will let $\alpha = 0.75$ and build a weighted elastic net regression model.
+
+```{r}
+elas_lm = glmnet(x, train_labels, alpha = 0.75, weights = train_weights)
+cv_out = cv.glmnet(x, train_labels, alpha = 0.75, weights = train_weights)
+pred5 = predict(lasso_lm, newx = model.matrix(~ . - 1, data = test_set)[, -1], s = cv_out$lambda.min)
+
+test_rmse7 = calcRMSE(test_labels, pred5)
+test_wmse7 = calcWMSE(test_labels, pred5, test_weights)
+cat("Test RMSE = ", test_rmse7, "\n")
+cat("Test WMSE = ", test_wmse7, "\n")
+```
+
+The model underperforms a little bit according to the wMSE, but we could improve it if we chose a better $\alpha$ for the model.
+
+### Random Forests
+
+The random forests model is an ensemble of trees similar to bagging where the trees are decorrelated by choosing $\sqrt{p}$ random predictors when we do a split on the feature space, where $p$ is the number of total predictors used for the model. We will build a random forest model and evaluate it.
+
+The predictions were produced ahead of time since building the random forest takes about 25 minutes on my computer (it would be about 4 more times as slower if we used the randomForest package).
+
+```{r, eval=F}
+library(ranger)
+
+rf_model = ranger(y ~ ., data = train_set, importance = 'impurity', seed = 42, write.forest = T)
+pred6 = predict(rf_model, test_set)
+
+test_rmse8 = calcRMSE(test_labels, pred6$predictions)
+test_wmse8 = calcWMSE(test_labels, pred6$predictions, test_weights)
+cat("Test RMSE = ", test_rmse8, "\n")
+cat("Test WMSE = ", test_wmse8, "\n")
+```
+
+```{r}
+pred6 = read.csv("rf_preds.csv")[,-1]
+
+test_rmse8 = calcRMSE(test_labels, pred6)
+test_wmse8 = calcWMSE(test_labels, pred6, test_weights)
+cat("Test RMSE = ", test_rmse8, "\n")
+cat("Test WMSE = ", test_wmse8, "\n")
+```
+
+The random forest model performs very well according to both the rMSE and the wMSE! Ensembles of decision trees very great for capturing the nonlinear patterns in data sets. Since the predictors are chosen randomly when growing the tree, the model is more robust to white noise or randomness in the data. If we had to choose one model for prediction, we would choose either this model or gradient boosted trees.
+
+## Ensemble of Regression Models
+
+In general, making predictions using one model usually does not provide the best results. In prediction competitions, the winning solutions generally use a combination of models, and where the final predictions are an average of predictions made from the models used. We will take the predictions from the weighted regression, ridge regression, and the lasso regression, and take an average of them and evaluate the ensembled model.
+
+```{r}
+pred_comb = (pred1 + pred2 + pred3)/3
+
+test_rmse9 = calcRMSE(test_labels, pred_comb)
+test_wmse9 = calcWMSE(test_labels, pred_comb, test_weights)
+cat("Test RMSE = ", test_rmse9, "\n")
+cat("Test WMSE = ", test_wmse9, "\n")
+```
+
+As we see, the ensembled model provides better predictions according to the wMSE compared to the models alone.
+
+## Using New Features for xgboost
+
+We will make new features to improve our prediction. The following code is based of Paddy Boris's 13th place solution, but we did not scale the features nor the response except for `Day`.
+
+```{r}
+feat_engin = function(dt) {
+  new1 = dt$x3B - dt$x5
+  new2 = dt$x3C - dt$x4
+  dt$Day = ceiling(dt$Day/10)
+  dt = cbind(dt, new1, new2)
+  return(dt)
+}
+
+train_set2 = feat_engin(train_set)
+test_set2 = feat_engin(test_set)
+
+train_set2 = data.matrix(train_set2[, y := NULL])
+test_set2 = data.matrix(test_set2)
+```
+
+We then build our boosted tree using xgboost. The model was trained ahead of time to save time rendering the document. Let's first see the variable importance plot. I also provided my feature importance plot for the model I submitted to the competition for reference.
+
+```{r,message=F}
+library(xgboost)
+bt = xgb.load("xgbmodel_featengineer")
+importance_matrix = xgb.importance(colnames(train_set2), model = bt)
+xgb.ggplot.importance(importance_matrix)
+```
+
+![](logpics/varimp.png)
+
+That new2 feature that we created was very important in reducing the error! This shows how feature engineering can better express the data and improve prediction. Now let's evaluate the error.
+
+```{r}
+pred7 = predict(bt, test_set2)
+test_rmse10 = calcRMSE(test_labels, pred7)
+test_wmse10 = calcWMSE(test_labels, pred7, test_weights)
+cat("Test RMSE = ", test_rmse10, "\n")
+cat("Test WMSE = ", test_wmse10, "\n")
+```
+
+The gradient boosted tree also performs well like the random forest. 
+
+## Summary of Models
+
+We provide a table summarizing the performance of the models we tested.
+
+```{r}
+rmse_list = c(test_rmse1, test_rmse2, test_rmse3, test_rmse4, test_rmse5, test_rmse6, test_rmse7, test_rmse8, test_rmse9, test_rmse10)
+wmse_list = c(test_wmse1, test_wmse2, test_wmse3, test_wmse4, test_wmse5, test_wmse6, test_wmse7, test_wmse8, test_wmse9, test_wmse10)
+dt_summary = data.frame(rmse_list, wmse_list)
+colnames(dt_summary) = c("Test rMSE", "Test wMSE")
+rownames(dt_summary) = c("Linear Regression with Intereactions", "Regression with OLS", "Regression with WLS", "Weighted Regression without x1", "Weighted Ridge Regression", "Weighted Lasso Regression", "Weighted Elastic Net Regression", "Random Forest", "Ensemble of Regression Models", "Boosted Trees with Feature Engineering")
+dt_summary
+```
+
+## Conclusion
+
+The tree based models performed the best for predicting this data set. It performs well since it can fit well to nonlinear patterns in the data. Also, using a combination of models together usually performs better than using a single model, as models have their own advantages and disadvantages when it comes to prediction. We could consider a combination of decision tree methods along with linear regression since trees fit well to nonlinear patterns while linear regression fits well to linear patterns. Using more cross-validation to choose better models and parameters can be done to improve prediction performance. The models in this report were quickly made, since CV can take a while to complete for large datasets like this one.
+
+## References
+
+Additional data exploration and visualizations are based off this blog post:
+https://medium.com/@samuel.monnier/notes-on-the-g-research-competition-91e691e9dbd7
+
+Feature engineering is based on based of Paddy Boris's 13th place solution:
+https://github.com/unnir/g_research_financial_forecasting_challenge/blob/master/train_and_predict.ipynb
+

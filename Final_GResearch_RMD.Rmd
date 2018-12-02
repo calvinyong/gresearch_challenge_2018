@@ -1,0 +1,522 @@
+---
+title: "GResearch Financial Forecasting Challenge"
+author: "Calvin Yong"
+date: "April 15, 2018"
+output: 
+  html_document: 
+    code_folding: show
+    df_print: default
+    fig_width: 8
+    highlight: textmate
+    theme: cerulean
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, echo=F}
+setwd("/home/calvin/Documents/Programming Workspace/Data Science Comps/GResearch comp/")
+```
+
+
+## GResearch Competition Summary
+
+This is the first data science competition I've ever competed in. I was introduced to this by my machine learning professor around the beginning of Spring 2018. I started looking at the training and test data around the end of January 2018, but started actually testing models around March. I exclusively used xgboost for this competition. My final model involved using principle component analysis (PCA), removing outliers from x3A, and using regularized gradient boosted trees to train on the data.
+
+I made a total of 17 submissions. I got a score of 0.306310 on the private leaderboard, which puts me rank 77/406, top 20%. I got a score of 0.315232 on the public leaderboard, which puts me at rank 86/406.
+
+![](images/final.png)
+
+The website for the competition is:
+https://financialforecasting.gresearch.co.uk/
+
+## Introduction to the GResearch Data and the challenge
+
+The goal for this competition is to predict the variable y, "an element of the return of a financial data series", given the other 14 predictors. Since the response is real valued variable, this competition is a regression problem. The submissions are evaluated based on the weight mean squared error (wMSE), that is, with the following formula
+
+$$\text{wMSE} = \sum_i w_i(\hat{y} - y_i)^2.$$
+My submission involved transforming some the correlated features into uncorrelated features using PCA, and using boosted trees to make the predictions. A popular package for boosted trees and for competitions in general is xgboost. The basic idea with decision trees is that we want to stratify or segment the feature space into a number of simple regions. Then for each region, the prediction we make is the mean or the mode of the observations in the region. Boosting uses an ensemble of trees, where each tree is grown sequentially. The method also learns slowly, which reduces the chances of overfitting. This report will show some of the steps I took to get top 20% on the private leaderboard and the progression to that final rank.
+
+## Data Exploration
+
+We first look at the data. Import the training and test data.
+
+```{r}
+train = read.csv("train.csv")
+test = read.csv("test.csv")
+```
+
+Lets take a look at how large the data sets are and look at the first few rows of data sets.
+
+```{r}
+cat("Dimension of train: ", dim(train), "\n",
+    "Dimension of test: ", dim(test))
+head(train)
+head(test)
+```
+
+Let's check how many unique stocks are there in each of the data sets. It's worth noting that the numbers of unique stocks are different from the two sets. We could check how many stocks are in both sets, but I didn't check that during my exploration.
+
+```{r}
+cat("Number of unique stocks in train: ", length(unique(train$Stock)), "\n",
+    "Number if unique stocks in test: ", length(unique(test$Stock)))
+```
+
+
+Check for missing values. If any, count number. Note that the missing values only come from `x1` and `x2`.
+
+```{r}
+cat("Any NA in train: ", anyNA(train), "\n",
+    "Any NA in test: ", anyNA(test))
+```
+
+Both data sets have missing values! Let's count many are there and calculate the percent of data missing.
+
+```{r}
+# Number of missing values
+sum_train = sum(is.na(train))
+sum_test = sum(is.na(test))
+cat("Number of NAs in train: ", sum_train, "\n",
+    "Number of NAs in test: ", sum_test, "\n",
+    "Percent data missing in train: ", 100*sum_train/prod(dim(train)), "%\n",
+    "Percent data missing in test: ", 100*sum_test/prod(dim(test)), "%")
+```
+
+The numbers are very small. Let's find where the missing values are.
+
+```{r}
+which_NA_train = apply(train, 2, anyNA)
+which_NA_test = apply(train, 2, anyNA)
+cat("Features in train which have NAs: ", names(train[which(which_NA_train)]), "\n",
+    "Features in test which have NAs: ", names(test[which(which_NA_test)]))
+```
+
+The missing values only come from x1 and x2. A look at a row with a missing value
+
+```{r}
+# Glimpse of row with missing data
+train[which(is.na(train$x1))[1], ]
+```
+
+It was noted in the competition website that "the features labeled 'x3A', 'x3B', etc. are strongly related and might be expected to be highly correlated." Let's look at the correlations in train. We won't show the the correlation matrix since it'll be a 15x15 matrix, but we'll show a heatmap (it's interactive!). 
+
+```{r, message=F}
+library(plotly)
+
+cor_matrix = as.matrix(cor(na.omit(train[, !(names(train) %in% c("Index", "Weight"))])))
+plot_ly(x = colnames(cor_matrix), y = colnames(cor_matrix), z = cor_matrix, type = "heatmap")
+```
+
+We can see that some of the variables are highly correlated. We can use heatmap.2 to get a dendrogram with an ordered heatmap.
+
+```{r, message=F}
+library(gplots)
+heatmap.2(cor_matrix, trace = "none")
+```
+
+
+We'll plot some stock returns on day for some stocks.
+
+
+```{r, fig.height = 8.5, fig.width = 9.5}
+stock_list = c(1223, 363, 1655, 2710, 15, 22, 1334, 2014, 1030)
+par(mfrow = c(3,3))
+for (i in stock_list) {
+  stock = train[which(train$Stock == i), ]
+  plot(stock$Day, stock$y, pch = 20, type = 'b',
+       main = paste("Stock", i), xlab = "Day", ylab = "y")
+}
+```
+
+That first plot is weird. This competition should probably be renamed to Financial Interpolation Challenge :p. 
+
+
+## The idea for my final submission
+
+### PCA and outliers
+
+I exclusively used xgboost for this competition, but I would have tried other models if I had time (and if they allowed teams).
+
+The idea was to use principal component analysis (PCA) on the five x3 features since we know they are correlated looking at the heatmap, replace the x3 features with the 5 principle components, tune the parameters with cross-validation (CV), then finally use CV to choose the number of rounds for the final model.
+
+So what if we use PCA on x3A, ..., x3E without looking at the data? The following code will produce something like this
+
+```{r}
+library(ggfortify)
+train_pca = prcomp(train[,8:12], retx = T, center = T, scale. = T)
+autoplot(train_pca, loadings = T, loadings.label = T)
+```
+
+
+The first principle component explains about 93% of the total variability! There's something wrong with that. Notice we have outliers at the bottom of the plot and the right side of the plot. I did not check for outliers before working on building on models, which I should have done. To see how large these outliers we make a one-dimensional scatterplot using the mvoutlier package.
+
+```{r, message=F, results='hide', fig.keep='all'}
+library(mvoutlier)
+uni.plot(train[,8:12], symb = T)
+```
+
+
+The red points are considered as outliers according the to the function. There are a lot of red points, but we do not want to get rid of all of them. For reference, let's calculate the mean, median, and max for each of the five x3 features.
+
+```{r}
+apply(train[, 8:12], 2, mean)
+apply(train[, 8:12], 2, median)
+apply(train[, 8:12], 2, max)
+```
+
+
+To start, we'll remove 7 seven outliers. In particular, the seven largest values from x3A.
+
+
+```{r}
+outliers = order(train$x3A, decreasing = T)[1:7]
+train = train[(-1)*outliers, ]
+#train = train[c(-137096, -562907, -149033, -146959, -151058, -102326, -155625), ]
+```
+
+
+Now let's look at the modified features.
+
+```{r, results='hide', fig.keep='all'}
+library(mvoutlier)
+uni.plot(train[,8:12], symb = T)
+```
+
+
+The data seems more reasonable now. Let's look at the PCs with the new data now
+
+```{r}
+train_pca = prcomp(train[,8:12], retx = T, center = T, scale. = T)
+autoplot(train_pca, loadings = T, loadings.label = T)
+```
+
+The PCs look more reasonable now. Replace the x3's in both the training and test set with the PCs.
+
+```{r}
+test_pca = predict(train_pca, newdata = test[8:12])
+
+train[,8:12] = NULL
+train = cbind(train, train_pca$x[,1:5])
+test[,8:12] = NULL
+test = cbind(test, test_pca[,1:5])
+```
+
+
+Let's take another look at the correlations now
+
+```{r}
+cor_matrix = as.matrix(cor(na.omit(train[, !(names(train) %in% c("Index", "Weight"))])))
+plot_ly(x = colnames(cor_matrix), y = colnames(cor_matrix), z = cor_matrix, type = "heatmap")
+```
+
+
+There are still some correlated features, but it's better. So now we start making the boosted tree model.
+ 
+### Making the Boosted Tree
+
+So now we start making our boosted tree model and tuning parameters. We use CV to choose each of the parameters. See the xgboost parameter documentation for an explanation for each parameter. First we need to find the number of rounds for some arbitrary but reasonable parameter values. Our CV would look something like this.
+
+```{r,eval=F}
+bt.cv = xgb.cv(data = train_noNA, label = response,
+               tree_method = "exact",
+               max_depth = 5,
+               min_child_weight = 9,
+               eta = 0.15,
+               subsample = 0.95,
+               colsample_bytree = 0.65,
+               gamma = 0,
+               alpha = 0,
+               lambda = 1,
+               nrounds = 10000,
+               nfold = 10,
+               early_stopping_rounds = 100,
+               maximize = FALSE,
+               objective = "reg:linear",
+               verbose = 1)
+```
+
+Whatever round the CV stops at, we use. The CV stopped at 120 rounds for me, so I'll use that. Then we want to tune our parameters
+
+
+```{r, eval=F}
+testlist = c(3,5,7,10)
+testlist2 = c(3,6,9)
+tic = proc.time()
+for (i in testlist) {
+  for (j in testlist2) {
+  bt.cv = xgb.cv(data = train_noNA, label = response,
+               tree_method = "exact",
+               max_depth = i,
+               min_child_weight = j,
+               eta = 0.2,
+               subsample = 0.95,
+               colsample_bytree = 0.65,
+               gamma = 0,
+               alpha = 0,
+               lambda = 1,
+               nrounds = 12,
+               nfold = 10,
+               early_stopping_rounds = NULL,
+               maximize = FALSE,
+               objective = "reg:linear",
+               seed = 1,
+               verbose = 0)
+  print(c(i,j))
+  print(bt.cv$evaluation_log[120])
+  CVoutput = rbind(CVoutput,data.frame(i,j,bt.cv$evaluation_log[120]))
+  gc()
+  }
+}
+```
+
+After we choose our parameters, we do one last CV to find the number of rounds, but with a smaller learning rate like 0.01. Once we find that number, we build our tree. The next section has the code for my final model.
+
+## Conclusion
+
+### My model for my final submission
+
+Here is the code for my final model.
+
+```{r, eval=F}
+library(xgboost)
+
+# Read data
+train = read.csv("train.csv")
+test = read.csv("test.csv")
+
+# Remove outliers
+outliers = order(train$x3A, decreasing = T)[1:7]
+train = train[(-1)*outliers, ]
+
+# Do PCA
+train_pca = prcomp(train[,8:12], retx = T, center = T, scale. = T)
+test_pca = predict(train_pca, newdata = test[8:12])
+
+# Replace x3's with PCs
+train[,8:12] = NULL
+train = cbind(train, train_pca$x[,1:5])
+test[,8:12] = NULL
+test = cbind(test, test_pca[,1:5])
+
+response = data.matrix(train$y)
+train_noNA = data.matrix(train[, !(names(train) %in% c("Index", "Weight", "y"))])
+test_noNA = data.matrix(test[, !(names(test) %in% c("Index"))])
+
+# Make tree
+bt = xgboost(data = train_noNA, label = response,
+                    tree_method = "exact",
+                    max_depth = 5,
+                    min_child_weight = 9,
+                    eta = 0.05,
+                    subsample = 0.95,
+                    colsample_bytree = 0.65,
+                    gamma = 0,
+                    alpha = 0.2,
+                    lambda = 1.75,
+                    nrounds = 1150,
+                    objective = "reg:linear")
+
+# Make predictions
+btpred = predict(bt, test_noNA)
+
+# Make submission file
+submit = data.frame(as.integer(1:nrow(test_noNA) - 1), btpred)
+colnames(submit) = c("Index", "y")
+write.csv(submit, file = "submit.csv", row.names = FALSE)
+```
+
+My CV gave me something like `[1150] train-rmse:0.0008832+3.45832329315441E-06	test-rmse:0.0009242+3.88582037670287E-05`.
+
+Let's plot the importance matrix and other graphs (I found out about deepness plot after the comp).
+
+```{r, message=F}
+library(xgboost)
+bt = xgb.load("myXGBmodel")
+
+train = train[, !(names(train) %in% c("Index", "Weight", "y"))]
+
+importance_matrix = xgb.importance(colnames(train), model = bt)
+xgb.ggplot.importance(importance_matrix)
+xgb.ggplot.deepness(bt)
+xgb.plot.deepness(bt, which = 'max.depth', pch = 16, col = rgb(0,0,1,0.3))
+```
+
+
+### What I've learned from my first comp
+
+
+At first I didn't even know xgboost even existed, but now I know the basics of it. I learned how to detect overfitting. I noticed that my test error was way different than my training error like below.
+
+![](logpics/cv.png)
+
+I learned how to use CV to tune my parameters. I also learned how outliers can affect PCA and even tree models.
+
+### Other things I wanted to try if I had time
+
+I would tried making other features, like possibly making "months" based on the day by dividing day by 30. I would have probably removed more outliers from the other features. I did not know about uni.plot's `symb` argument until after where I can see how big the outlier is based on the colors. I would have liked to use the more advanced interface `xgb.train()` so I can make a watchlist and use a custom error metric like wMSE. I also would have liked to try ensembles of models. Next time I will look into LightGBM
+
+
+
+## Log of other models and scores
+
+The attempts are ordered from earliest to latest submission. I did not record all of my attempts since some of them did not improve.
+
+### March 3rd
+
+**1st Submission**
+
+I don't want to talk about this lol. This puts me at rank 257 out of 282 as of March 3rd 2018 with a score of 0.518670. It's a start.
+
+
+```{r, eval=F}
+library(neuralnet)
+
+set.seed(1)
+nn = neuralnet(y ~ Market + Day + Stock + x0 + x3C +x6, data = train, hidden = c(1,1), act.fct = "tanh")
+input = test[, c("Market", "Day", "Stock", "x0", "x3C", "x6")]
+newoutput = compute(nn, covariate = input)
+
+plot(nn)
+head(newoutput$net.result)
+```
+
+![](logpics/1.png)
+
+### March 18th
+
+**2nd Submission**
+
+This was my first model using xgboost, before I even knew what the parameters mean :p. I also removed x1 and x2 for this model. This put me at rank 115 out of 302 as of March 18 2018 with a public score of 0.367845.
+
+```{r, eval=F}
+bt = xgboost(data = train_noNA, label = response,
+              max_depth = 7,
+              eta = 1,
+              nrounds = 2,
+              objective = "reg:linear")
+```
+
+
+![](logpics/2.png)
+
+
+### March 29th
+
+**3rd Submission**
+
+Changing some parameters put me at rank 103 out of 328 as of March 29th with a public score of 0.325836. Still don't completely know what the parameters mean back in the time and still did not use x1 and x2 in the model.
+
+```{r, eval=F}
+bt = xgboost(data = train_noNA, label = response,
+             tree_method = "exact",
+             max_depth = 10,
+             eta = 0.2,
+             nrounds = 50,
+             objective = "reg:linear")
+```
+
+![](logpics/3.png)
+
+On the same day, I removed the NAs in train replaced the test NAs with means, which put me at rank 91 out of 328 with  a public score of 0.322145.
+
+![](logpics/4.png)
+
+### April 7th
+
+**8th Submission**
+
+XGBoost can deal with NAs, this one was without dealing with them. Get score of 0.321629 to rank 104 out of 361 as of April 7.
+
+```{r, eval=F}
+  bt = xgboost(data = train_noNA, label = response,
+             tree_method = "exact",
+             max_depth = 10,
+             eta = 0.05,
+             nrounds = 200,
+             objective = "reg:linear")
+```
+
+
+
+
+### April 8th
+
+
+After lots of cross validation, I tuned my parameters to get 0.318506, rank 93/364 as of April 8
+
+```{r, eval=F}
+bt = xgboost(data = train_noNA, label = response,
+                    tree_method = "exact",
+                    max_depth = 5,
+                    min_child_weight = 8,
+                    eta = 0.05,
+                    subsample = 0.95,
+                    colsample_bytree = 0.65,
+                    gamma = 0,
+                    alpha = 0.1,
+                    lambda = 1.5,
+                    nrounds = 533,
+                    objective = "reg:linear",
+                    seed = 1)
+```
+
+![](logpics/5.png)
+
+
+### April 13th
+
+Dropped from 99 to 87/390 with score of 0.316192 as of April 13, by using more rounds and smaller eta.
+
+```{r, eval=F}
+bt = xgboost(data = train_noNA, label = response,
+                    tree_method = "exact",
+                    max_depth = 5,
+                    min_child_weight = 8,
+                    eta = 0.1,
+                    subsample = 0.95,
+                    colsample_bytree = 0.65,
+                    gamma = 0,
+                    alpha = 0.1,
+                    lambda = 1.5,
+                    nrounds = 2000,
+                    objective = "reg:linear")
+```
+
+
+
+## Links I've read during this competition
+
+
+**XGBoost and tuning**
+
+http://xgboost.readthedocs.io/en/latest/
+
+https://www.analyticsvidhya.com/blog/2016/03/complete-guide-parameter-tuning-xgboost-with-codes-python/
+
+https://www.dataiku.com/learn/guide/code/python/advanced-xgboost-tuning.html
+
+https://sadanand-singh.github.io/posts/boostedtrees/
+
+
+**PCA**
+
+
+https://stats.stackexchange.com/questions/72839/how-to-use-r-prcomp-results-for-prediction
+
+http://jotterbach.github.io/2016/03/24/Principal_Component_Analysis/
+
+https://cran.r-project.org/web/packages/ggfortify/
+
+**Other**
+
+https://www.kdnuggets.com/2017/02/stacking-models-imropved-predictions.html
+
+https://devblogs.nvidia.com/gradient-boosting-decision-trees-xgboost-cuda/
+
+https://www.kaggle.com/c/GiveMeSomeCredit/discussion/1166
+
+
+
+
